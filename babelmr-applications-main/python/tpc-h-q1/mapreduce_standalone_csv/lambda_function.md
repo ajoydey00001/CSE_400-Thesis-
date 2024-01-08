@@ -1,100 +1,50 @@
+This Lambda function performs map-reduce operations on data stored in S3, and the details of the operations are provided in the event parameter. The data is read, processed, and written back to S3.
 
-These functions together form a Lambda function that reads, processes, and writes Parquet data based on the specified mode (map or reduce). The `map` function applies a filter, performs calculations, and writes the result, while the `reduce` function performs aggregation and writes the result. The Lambda handler decides which function to call based on the mode provided in the input event.
-
-### `read_partitioned` Function:
+### `read_partitioned(file_desc)`:
 - Parameters:
-    - `file_desc`: Information about the file (bucket, key, partitions).
-    - `columns`: Columns to be read from the Parquet file.
-    - `opener`: File opener for Parquet files.
-    - `filter`: Boolean flag indicating whether to apply a filter during reading.
+    - `file_desc`: A dictionary containing information about the file, including 'bucket' and 'key'.
 - Body:
-    - Reads a partitioned Parquet file based on the provided file description.
-    - Optionally applies a filter on the 'l_shipdate' column if `filter` is True.
-    - Returns a Pandas DataFrame.
-- code:
+    - Constructs the S3 path using 'bucket' and 'key'.
+    - Reads a CSV file from S3 using pandas.
+    - Returns a pandas DataFrame.
+### `read_partitioned_parallel(file_descriptions)`:
+- Parameters:
+    - `file_descriptions`: A list of dictionaries, each describing a file (e.g., 'Import' files).
+- Body:
+    - Uses ThreadPoolExecutor to read multiple partitions concurrently.
+    - Calls `read_partitioned` for each file description.
+    - Concatenates the DataFrames obtained from each partition.
+    - Returns a pandas DataFrame obtained by concatenating results from different partitions.
+### `map(event)`
+- Parameters:
+    - `event`: A dictionary containing information about the map operation, including 'Import' and 'Export' details.
+- Body:
+    - Calls `read_partitioned_parallel` to read data from 'Import' partitions.
+    - Filters the DataFrame based on the condition `df["l_shipdate"] <= "1998-09-02"`.
+    - Performs some calculations on the DataFrame.
+    - Writes the resulting DataFrame to an S3 location specified in the 'Export' details.
+- Code : 
 ```python
-
-def read_partitioned(file_desc, columns, opener, filter=False):
-    # Create an empty DataFrame to store the read data
-    df = pd.DataFrame()
-
-    # Construct the full path to the Parquet file using the bucket and key from file_desc
-    input_file = f"{file_desc['bucket']}/{file_desc['key']}"
-
-    # Extract the list of partitions from the file description
-    partitions = file_desc["partitions"]
-
-    # Open the Parquet file using ParquetFile and the provided opener
-    pf = ParquetFile(input_file, open_with=opener)
-
-    # Iterate over each row group (rg) in the Parquet file
-    for i, rg in enumerate(pf):  # read only said partitions:
-
-        # Check if specific partitions are specified or if the list is empty (read all partitions)
-        if partitions == [] or i in partitions:
-            # Check if a filter is specified
-            if filter:
-                # Apply a filter to the 'l_shipdate' column and concatenate the result to the DataFrame
-                partition_data = rg.to_pandas(
-                    columns=columns, filters=[("l_shipdate", "<=", "1998-09-02")]
-                )
-                df = pd.concat(
-                    [df, partition_data[partition_data["l_shipdate"] <= "1998-09-02"]]
-                )
-            else:
-                # Concatenate the entire row group to the DataFrame
-                df = pd.concat([df, rg.to_pandas(columns=columns)])
-
-    # Return the final DataFrame containing the read data
-    return df
-
-```
-### `wrapper_read_partitioned` Function:
-- Parameters:
-    - `columns`: Columns to be read from the Parquet file.
-    - `opener`: File opener for Parquet files.
-    - `filter`: Boolean flag indicating whether to apply a filter during reading.
-- Body:
-    - Returns a partially applied version of read_partitioned with specified    columns, opener, and filter. 
-### `read_partitioned_parallel` Function:
-- Parameters: 
-    - `file_descriptions`: List of file descriptions.
-    - `columns`: Columns to be read from the Parquet file.
-    - `opener`: File opener for Parquet files.
-    - `filter`: Boolean flag indicating whether to apply a filter during reading.
-- Body:
-    - Reads multiple partitioned Parquet files in parallel using multithreading.
-    - Uses `wrapper_read_partitioned` to create a partially applied version with specified columns, opener, and filter.
-    - Returns a concatenated Pandas DataFrame.
-### `map Function`:
-- Parameters:
-    - `columns`: Columns to be read from the Parquet file.
-    - `s3`: S3 file system object.
-    - `event`: Lambda event containing import/export details.
-    - `myopen`: File opener for S3 files.
-- Body:
-    - Reads partitioned Parquet files in parallel, applies calculations to create new columns (`pre_1` and `pre_2`).
-    - Performs groupby operations and exports the result as a new Parquet file.
-    - Records time metrics for import, calculation, and export phases.
-- Code:
-```python
-def map(columns, s3, event, myopen):
+def map(event):
     # Declare global variables to track time metrics
     global IMPORT_TIME, CALC_TIME, EXPORT_TIME
-
-    # Read the partitioned data in parallel using the read_partitioned_parallel function
-    df = read_partitioned_parallel(event["Import"], columns, myopen, filter=True)
-
-    # Record the start time for the import phase
+    
+    # Read data in parallel from 'Import' partitions
+    df = read_partitioned_parallel(event["Import"])
+    
+    # Filter data based on the condition: l_shipdate <= "1998-09-02"
+    df = df[df["l_shipdate"] <= "1998-09-02"]
+    
+    # Record the import time
     IMPORT_TIME = time.time()
-
-    # Perform additional computations on the DataFrame
+    
+    # Perform calculations on the DataFrame
     df["pre_1"] = df["l_extendedprice"] * (1 - df["l_discount"])
     df["pre_2"] = df["pre_1"] * (1 + df["l_tax"])
-
-    # Group the DataFrame based on specified columns
+    
+    # Group the DataFrame by 'l_returnflag' and 'l_linestatus'
     grouped = df.groupby(["l_returnflag", "l_linestatus"])
-
+    
     # Create a new DataFrame with aggregated results
     map_tpc_h_q1 = pd.DataFrame(
         {
@@ -108,80 +58,71 @@ def map(columns, s3, event, myopen):
             "count_order": grouped.size(),
         }
     ).reset_index()
-
-    # Record the start time for the calculation phase
+    
+    # Record the calculation time
     CALC_TIME = time.time()
-
-    # TODO: handle cases where partition ends up being empty (e.g. add null element so that row group can be created)
-
-    # Determine the number of output partitions specified in the event
+    
+    # TODO: handle cases where partition ends up being empty (e.g., add null element so that a row group can be created)
+    
+    # Determine the number of output partitions for export
     out_partitions = event["Export"]["number_partitions"]
-
-    # Calculate a 'partition' column based on specified logic
+    
+    # Add a 'partition' column based on the given formula
     map_tpc_h_q1["partition"] = (
         map_tpc_h_q1["l_returnflag"].apply(ord) // 2
         + map_tpc_h_q1["l_linestatus"].apply(ord) // 3
     ) % out_partitions
-
+    
     # Sort the DataFrame based on the 'partition' column
     map_tpc_h_q1.sort_values("partition", inplace=True)
-
-    # Determine the offsets of row groups for writing to output partitions
-    row_group_offsets = map_tpc_h_q1["partition"].searchsorted(
-        range(out_partitions), side="left"
-    )
-
-    # Write the DataFrame to the specified S3 location in Parquet format
-    write(
-        f"{event['Export']['bucket']}/{event['Export']['key']}",
-        map_tpc_h_q1,
-        row_group_offsets=row_group_offsets,
-        open_with=myopen,
-        write_index=False
-    )
-
-    # Record the start time for the export phase
+    
+    # Write the resulting DataFrame to an S3 location specified in 'Export' details
+    map_tpc_h_q1.to_csv(f"s3://{event['Export']['bucket']}/{event['Export']['key']}")
+    
+    # Record the export time
     EXPORT_TIME = time.time()
 
 ```
-### `reduce Function`:
+### `reduce(event)` :
 - Parameters:
-    - `columns`: Columns to be read from the Parquet file.
-    - `s3`: S3 file system object.
-    - `event`: Lambda event containing import/export details.
-    - `myopen`: File opener for S3 files.
+    - `event`: A dictionary containing information about the reduce operation, including 'Import' and 'Export' details.
 - Body:
-    - Reads partitioned Parquet files in parallel.
-    - Performs a custom reduction operation and exports the result as a new Parquet file.
-    - Records time metrics for import, calculation, and export phases.
-    - Returns `None`.
+    - Calls `read_partitioned_parallel` to read data from 'Import' partitions.
+    - Groups the DataFrame by 'l_returnflag' and 'l_linestatus'.
+    - Performs aggregation on the grouped data.
+    - Writes the resulting DataFrame to an S3 location specified in the 'Export' details.
+    - No explicit return; data is written to S3.
 - Code:
 ```python
-def reduce(columns, s3, event, myopen):
+def reduce(event):
     # Declare global variables to track time metrics
     global IMPORT_TIME, CALC_TIME, EXPORT_TIME
-
-    # Read the partitioned data in parallel using the read_partitioned_parallel function
-    df = read_partitioned_parallel(event["Import"], columns, myopen)
-
-    # Record the start time for the import phase
+    
+    # Read data in parallel from 'Import' partitions
+    df = read_partitioned_parallel(event["Import"])
+    
+    # Record the import time
     IMPORT_TIME = time.time()
-
-    # Initialize an empty dictionary to store values grouped by a key
+    
+    # Initialize an empty dictionary to store values for each unique key
     KEY_VAL = {}
-
-    # Iterate through the DataFrame and group values based on specified columns
+    
+    # Iterate over rows of the DataFrame and organize data into the dictionary
     for i, row in enumerate(zip(df["l_returnflag"], df["l_linestatus"])):
         values_for_key = KEY_VAL.setdefault(row, [])
         values_for_key.append(df.iloc[i])
 
-    # Initialize an empty list to store aggregated values
+    # Initialize a list to store aggregated results
     return_df_list = []
-
-    # Iterate through the grouped values and calculate aggregations
+    
+    # Iterate over keys and their associated values in the dictionary
     for key, values in KEY_VAL.items():
+        # Deep copy the first value for aggregation
         agg = deepcopy(values[0])
+        
+        # Iterate over the remaining values for aggregation
         for val in values[1:]:
+            # Aggregate numerical columns
             for x in [
                 "sum_qty",
                 "sum_base_price",
@@ -193,80 +134,36 @@ def reduce(columns, s3, event, myopen):
                 "count_order",
             ]:
                 agg[x] += val[x]
+        
+        # Calculate averages for aggregated values
         agg["avg_qty"] /= agg["count_order"]
         agg["avg_price"] /= agg["count_order"]
         agg["avg_disc"] /= agg["count_order"]
+        
+        # Append the aggregated result to the list
         return_df_list.append(agg)
 
-    # Create a DataFrame from the aggregated values and sort it
+    # Create a DataFrame from the list and sort by 'l_returnflag' and 'l_linestatus'
     df = pd.DataFrame(return_df_list).sort_values(["l_returnflag", "l_linestatus"])
-
-    # Record the start time for the calculation phase
+    
+    # Record the calculation time
     CALC_TIME = time.time()
-
-    # Write the DataFrame to the specified S3 location in Parquet format
-    write(f"{event['Export']['bucket']}/{event['Export']['key']}", df, open_with=myopen, write_index=False)
-
-    # Record the start time for the export phase
+    
+    # Write the resulting DataFrame to an S3 location specified in 'Export' details
+    df.to_csv(f"s3://{event['Export']['bucket']}/{event['Export']['key']}")
+    
+    # Record the export time
     EXPORT_TIME = time.time()
 
 ```
-### `lambda_handler` Function:
+### `lambda_handler(event, context)` :
 - Parameters:
-    - `event`: Lambda event containing mode and other details.
-    - `context`: Lambda context.
+    - `event`: A dictionary containing information about the Lambda invocation, including 'mode' (map or reduce).
+    - `context`: Lambda execution context.
 - Body:
-    - Records the start timestamp.
-    - Determines the operation mode (`map` or `reduce`) from the provided event.
-    - Calls the corresponding `map` or `reduce` function.
-    - Records timestamps for different phases (import, calculation, export).
-    - Returns a dictionary containing a success message and timing information.
-- Code:
-```python
-def lambda_handler(event, context):
-    # Record the start time for the entire Lambda function
-    TIMESTAMP = time.time()
-
-    # Define the columns to be used in the processing
-    columns = [
-        "l_quantity",
-        "l_extendedprice",
-        "l_discount",
-        "l_shipdate",
-        "l_tax",
-        "l_returnflag",
-        "l_linestatus",
-    ]
-
-    # Create an S3FileSystem object for interacting with S3
-    s3 = s3fs.S3FileSystem()
-
-    # Define the open function for S3 file access
-    myopen = s3.open
-
-    # Check the processing mode specified in the event
-    if event["mode"] == "map":
-        # Call the map function for the "map" processing mode
-        map(columns, s3, event, myopen)
-    elif event["mode"] == "reduce":
-        # Call the reduce function for the "reduce" processing mode
-        reduce(None, s3, event, myopen)
-
-    # Return a dictionary containing a success message and time metrics
-    return {
-        "message": "success",
-        "times": [
-            {
-                "timestamp": TIMESTAMP * 1000,
-                "Import": IMPORT_TIME * 1000,
-                "Calculation": CALC_TIME * 1000,
-                "Export": EXPORT_TIME * 1000,
-            }
-        ],
-    }
-
-```
-
+    - Records the start time.
+    - Calls either `map` or `reduce` based on the 'mode' specified in the event.
+    - Returns a dictionary with a success message and time metrics for different phases of the processing.
 
 
 
