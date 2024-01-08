@@ -11,6 +11,44 @@ These functions together form a Lambda function that reads, processes, and write
     - Reads a partitioned Parquet file based on the provided file description.
     - Optionally applies a filter on the 'l_shipdate' column if `filter` is True.
     - Returns a Pandas DataFrame.
+- code:
+```python
+
+def read_partitioned(file_desc, columns, opener, filter=False):
+    # Create an empty DataFrame to store the read data
+    df = pd.DataFrame()
+
+    # Construct the full path to the Parquet file using the bucket and key from file_desc
+    input_file = f"{file_desc['bucket']}/{file_desc['key']}"
+
+    # Extract the list of partitions from the file description
+    partitions = file_desc["partitions"]
+
+    # Open the Parquet file using ParquetFile and the provided opener
+    pf = ParquetFile(input_file, open_with=opener)
+
+    # Iterate over each row group (rg) in the Parquet file
+    for i, rg in enumerate(pf):  # read only said partitions:
+
+        # Check if specific partitions are specified or if the list is empty (read all partitions)
+        if partitions == [] or i in partitions:
+            # Check if a filter is specified
+            if filter:
+                # Apply a filter to the 'l_shipdate' column and concatenate the result to the DataFrame
+                partition_data = rg.to_pandas(
+                    columns=columns, filters=[("l_shipdate", "<=", "1998-09-02")]
+                )
+                df = pd.concat(
+                    [df, partition_data[partition_data["l_shipdate"] <= "1998-09-02"]]
+                )
+            else:
+                # Concatenate the entire row group to the DataFrame
+                df = pd.concat([df, rg.to_pandas(columns=columns)])
+
+    # Return the final DataFrame containing the read data
+    return df
+
+```
 ### `wrapper_read_partitioned` Function:
 - Parameters:
     - `columns`: Columns to be read from the Parquet file.
