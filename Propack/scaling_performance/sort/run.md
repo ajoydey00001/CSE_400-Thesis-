@@ -1,96 +1,74 @@
+### `run_lam` Function:
+- Parameters:
+    - `nj`: The total number of invocations or concurrency level.
+    - `parallel`: The number of invocations to be performed in parallel.
+- Body:
+    - A loop runs to invoke AWS Lambda functions in parallel. The aws lambda invoke command is used with a payload, and the response is redirected to a file. Each invocation is performed with a subprocess.
+    - `scaling_time` is calculated as the time taken for the parallel invocations to complete.
+    - A loop waits for all the Lambda invocations to complete by checking the status of each process in `pro_list`.
+    - `service_time` is calculated as the total time taken for all invocations.
+    - Responses from Lambda invocations are concatenated and written to a file named 'response-concurrency' + str(nj) + '.txt'.
 
-
-
-# Project Title
-
-A brief description of what this project does and who it's for
-
-
-
-
-
-###code with explaination
+### Code with Explaination :
 ```python
-### Description :
-- `Import`: Reads partitioned store sales data from S3.
-- `Grouping`: Groups store sales by 'ss_ticket_number' and collects unique 'item_id' values for each ticket.
-- `Counting Pairs`: Counts combinations of sorted item pairs using a Counter.
-- `DataFrame Conversion`: Converts the Counter to a DataFrame and renames columns.
-- `Partitioning`: Calculates 'partition' based on 'item1' and the specified number of partitions.
-- `Sorting`: Sorts the data based on the 'partition' column.
-- `Row Group Offsets`: Calculates row group offsets for the output partitions.
-- `Export`: Writes the counted pairs data to the specified S3 location in Parquet format.
-- `Timing`: Records and returns timing information (import, calculation, and export times).
+
+# Open a file object for writing to /dev/null (a null device)
+FNULL = open(os.devnull, 'w')
+
+# Lists to store service times and scaling times
+st_list = []
+scale_list = []
+
+# Function to run AWS Lambda in parallel
+def run_lam(nj, parallel):
+    num = int(nj / parallel)
+    i = 1
+    pro_list = []
+    start_time = time.time()
+
+    # Invoke AWS Lambda functions in parallel
+    while i <= num:
+        command = "aws lambda invoke --function-name scaling_test_sort --payload \'{\"key1\":\"" + str(
+            parallel) + "\"}\' response" + str(i) + ".txt"
+        p = sp.Popen(shlex.split(command), stdout=FNULL)
+        pro_list.append(p)
+        i += 1
+
+    scaling_time = time.time() - start_time  # Time taken for scaling
+    # Wait for all Lambda invocations to complete
+    for p in pro_list:
+        while True:
+            poll = p.poll()
+            if poll is None:
+                continue
+            else:
+                break
+
+    service_time = time.time() - start_time  # Total service time
+    filenames = ["response" + str(i + 1) + ".txt" for i in range(num)]
+
+    # Write Lambda responses to a file
+    with open('response-concurrency' + str(nj) + '.txt', 'w') as outfile:
+        for fname in filenames:
+            try:
+                with open(fname) as infile:
+                    outfile.write(infile.read())
+                    outfile.write("\n")
+            except:
+                pass
+
+    # Remove response files
+    for file in filenames:
+        try:
+            command = "sudo rm "
+            command += file + " "
+            sp.check_output(shlex.split(command))
+        except:
+            pass
+
+    st_list.append(service_time)
+    scale_list.append(scaling_time)
 
 
-### Code with explaination :
-```python
-def map2(event, myopen):
-    TIMESTAMP = time.time()  # Record the current timestamp
-    store_sales = read_partitioned_parallel(
-        event["Import"], ["item_id", "ss_ticket_number"], myopen
-    )  # Read partitioned store sales data (columns: 'item_id', 'ss_ticket_number')
 
-    IMPORT_TIME = time.time()  # Record the import time
-
-    # Group store sales by 'ss_ticket_number' and collect unique 'item_id' values for each ticket
-    sold_together = store_sales.groupby("ss_ticket_number")["item_id"].unique()
-
-    counted_pairs = Counter()  # Initialize a counter for counting item pairs
-
-    # Iterate over unique item sets in each ticket and update the counter with combinations of sorted items
-    for items in sold_together:
-        counted_pairs.update(itertools.combinations(sorted(items), 2))
-
-    CALC_TIME = time.time()  # Record the calculation time
-
-    # Convert the counter to a DataFrame and rename columns
-    counted_pairs = (
-        pd.DataFrame.from_dict(counted_pairs, orient="index")
-        .reset_index()
-        .rename(columns={"index": "item_pairs", 0: "count"})
-    )
-
-    # Split 'item_pairs' column into two columns: 'item1' and 'item2'
-    counted_pairs[["item1", "item2"]] = pd.DataFrame(
-        counted_pairs["item_pairs"].tolist(), index=counted_pairs.index
-    )
-    del counted_pairs["item_pairs"]
-
-    out_partitions = event["Export"].setdefault("number_partitions", 10)  # Set the number of output partitions
-
-    # Calculate 'partition' based on 'item1' and specified number of partitions
-    counted_pairs["partition"] = counted_pairs["item1"] % out_partitions
-    counted_pairs.sort_values("partition", inplace=True)
-
-    # Calculate row group offsets for the output partitions
-    row_group_offsets = counted_pairs["partition"].searchsorted(
-        range(out_partitions), side="left"
-    )
-
-    # Write the counted pairs data to the specified S3 location in Parquet format
-    write(
-        f"{event['Export']['bucket']}/{event['Export']['key']}",
-        counted_pairs,
-        row_group_offsets=row_group_offsets,
-        open_with=myopen,
-        write_index=False
-    )
-
-    EXPORT_TIME = time.time()  # Record the export time
-
-    # Return a dictionary with success message and timing information
-    return {
-        "message": "success",
-        "times": [
-            {
-                "timestamp": TIMESTAMP * 1000,
-                "Import": IMPORT_TIME * 1000,
-                "Calculation": CALC_TIME * 1000,
-                "Export": EXPORT_TIME * 1000,
-            }
-        ],
-    }
-
-```
 ```
